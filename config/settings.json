@@ -1,0 +1,39 @@
+{
+  "wechat_path": "D:\\Program Files\\Tencent\\Weixin\\4.1.8.28",
+  "wechatocr_path": "%APPDATA%\\Tencent\\xwechat\\XPlugin\\plugins\\WeChatOcr\\8082\\extracted\\wxocr.dll",
+  "save_dir": "temp",
+  "temp_dir": "temp",
+  "hotkeys": {
+    "morse": "f1",
+    "fingerprint": "f6",
+    "exit": "end"
+  },
+  "fingerprint_images_dir": "images",
+  "fingerprint_auto_click": true,
+  "fingerprint": {
+    "name_region": {"x1": 706, "y1": 657, "x2": 866, "y2": 689},
+    "number_region": {"x1": 1030, "y1": 530, "x2": 1365, "y2": 930},
+    "candidate_boxes": [
+      [1522, 560, 1627, 665],
+      [1650, 560, 1755, 665],
+      [1778, 560, 1883, 665],
+      [1522, 687, 1627, 792],
+      [1650, 687, 1755, 792],
+      [1778, 687, 1883, 792],
+      [1522, 815, 1627, 920],
+      [1650, 815, 1755, 920],
+      [1778, 815, 1883, 920]
+    ],
+    "mode_config": {
+      "8": {"mode": "C", "candidates": 9, "indices": [0, 1, 2, 3, 4, 5, 6, 7, 8]},
+      "6": {"mode": "B", "candidates": 7, "indices": [0, 1, 2, 3, 4, 5, 6]},
+      "4": {"mode": "A", "candidates": 5, "indices": [0, 1, 2, 3, 4]}
+    },
+    "match_threshold": 0.5
+  },
+  "regions": [
+    { "name": "区域1", "left": 699, "top": 514, "width": 200, "height": 50 },
+    { "name": "区域2", "left": 967, "top": 514, "width": 200, "height": 50 },
+    { "name": "区域3", "left": 1234, "top": 514, "width": 200, "height": 50 }
+  ]
+}
