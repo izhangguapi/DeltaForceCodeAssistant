@@ -18,8 +18,8 @@ _DEFAULT_CONFIG: dict[str, Any] = {
     "save_dir": "temp",
     "temp_dir": "temp",
     "hotkeys": {
-        "morse": "f1",
-        "fingerprint": "f6",
+        "morse": "ctrl+alt+q",
+        "fingerprint": "ctrl+alt+w",
         "exit": "end"
     },
     "fingerprint_images_dir": "images",

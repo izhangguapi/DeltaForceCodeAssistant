@@ -41,71 +41,88 @@ def _get_font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
     return ImageFont.load_default()
 
 
-def preview_regions(regions: list[dict], save_dir: str = "captures") -> str:
+def preview_regions(
+    regions: list[dict],
+    save_dir: str = "captures",
+    *,
+    fp_name: dict | None = None,
+    fp_number: dict | None = None,
+    fp_boxes: list[list[int]] | None = None,
+) -> str:
     """
-    截取当前全屏，在图上标注 regions 中每个区域的彩色矩形框与名称，
-    将结果保存到 save_dir 目录，然后用系统默认图片程序打开。
+    截取当前全屏，在图上标注区域的彩色矩形框与名称，
+    将结果保存到 save_dir，然后用系统默认图片程序打开。
 
     Args:
-        regions:  区域列表，每项含 name / left / top / width / height。
-        save_dir: 截图保存目录，默认为 captures/。
-
-    Returns:
-        保存的文件路径。
+        regions:      区域列表，每项含 name / left / top / width / height。
+        save_dir:      截图保存目录，默认为 captures/。
+        fp_name:       指纹人名区域 {x1, y1, x2, y2}。
+        fp_number:    指纹数字区域 {x1, y1, x2, y2}。
+        fp_boxes:     指纹候选格子列表，每项 [x1, y1, x2, y2]。
     """
-    # 1. 截全屏
     screenshot: Image.Image = ImageGrab.grab()
     draw = ImageDraw.Draw(screenshot)
     font = _get_font(_FONT_SIZE)
 
-    # 2. 逐区域画框 + 标签
+    # ── 摩斯码区域 ───────────────────────────────────────
     for idx, region in enumerate(regions):
         name   = region.get("name", f"区域{idx + 1}")
         left   = region["left"]
-        top    = region["top"]
+        top_   = region["top"]
         right  = left + region["width"]
-        bottom = top  + region["height"]
+        bottom = top_ + region["height"]
         color  = _PALETTE[idx % len(_PALETTE)]
+        _draw_box(draw, font, left, top_, right, bottom, color, name)
 
-        # 画矩形框（粗细 _LINE_WIDTH）
-        for offset in range(_LINE_WIDTH):
-            draw.rectangle(
-                [left - offset, top - offset, right + offset, bottom + offset],
-                outline=color,
-            )
+    # ── 指纹区域 ─────────────────────────────────────────
+    if fp_name:
+        _draw_box(draw, font,
+                  fp_name["x1"], fp_name["y1"], fp_name["x2"], fp_name["y2"],
+                  "#FFAA00", "人名")
 
-        # 计算标签背景区域
-        label = f" {name} "
-        bbox = font.getbbox(label)
-        text_w = bbox[2] - bbox[0]
-        text_h = bbox[3] - bbox[1]
-        lx = left
-        ly = max(0, top - text_h - _LABEL_PAD * 2 - _LINE_WIDTH)
+    if fp_number:
+        _draw_box(draw, font,
+                  fp_number["x1"], fp_number["y1"], fp_number["x2"], fp_number["y2"],
+                  "#FF8800", "数字")
 
-        # 标签背景色块
-        draw.rectangle(
-            [lx, ly, lx + text_w + _LABEL_PAD * 2, ly + text_h + _LABEL_PAD * 2],
-            fill=color,
-        )
-        # 标签文字（白色）
-        draw.text(
-            (lx + _LABEL_PAD, ly + _LABEL_PAD),
-            label,
-            fill="white",
-            font=font,
-        )
+    if fp_boxes:
+        for idx, box in enumerate(fp_boxes):
+            x1, y1, x2, y2 = box
+            _draw_box(draw, font, x1, y1, x2, y2,
+                      _PALETTE[idx % len(_PALETTE)], f"格子{idx + 1}")
 
-    # 3. 保存到 captures 目录
+    # ── 保存并打开 ────────────────────────────────────────
     os.makedirs(save_dir, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     save_path = os.path.join(save_dir, f"preview_{timestamp}.png")
     screenshot.save(save_path)
-
-    # 4. 用系统默认程序打开
     _open_image(save_path)
     print(f"[预览] 已保存并打开标注图：{save_path}")
-
     return save_path
+
+
+def _draw_box(
+    draw: ImageDraw.ImageDraw,
+    font: ImageFont.FreeTypeFont | ImageFont.ImageFont,
+    x1: int, y1: int, x2: int, y2: int,
+    color: str,
+    label: str,
+) -> None:
+    """在给定矩形区域上画边框和标签。"""
+    for offset in range(_LINE_WIDTH):
+        draw.rectangle([x1 - offset, y1 - offset, x2 + offset, y2 + offset],
+                       outline=color)
+    bbox = font.getbbox(f" {label} ")
+    text_w = bbox[2] - bbox[0]
+    text_h = bbox[3] - bbox[1]
+    lx = x1
+    ly = max(0, y1 - text_h - _LABEL_PAD * 2 - _LINE_WIDTH)
+    draw.rectangle(
+        [lx, ly, lx + text_w + _LABEL_PAD * 2, ly + text_h + _LABEL_PAD * 2],
+        fill=color,
+    )
+    draw.text((lx + _LABEL_PAD, ly + _LABEL_PAD), f" {label} ",
+              fill="white", font=font)
 
 
 def _open_image(path: str) -> None:

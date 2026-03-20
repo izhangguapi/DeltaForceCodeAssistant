@@ -19,10 +19,12 @@ import wcocr
 from PIL import Image
 
 _initialized = False
-_temp_dir = "captures"   # OCR 中转图存放目录，识别完毕后立即删除
+_temp_dir = "captures"  # OCR 中转图存放目录，识别完毕后立即删除
 
 
-def init(wechatocr_path: str = None, wechat_path: str = None, temp_dir: str = None) -> bool:
+def init(
+    wechatocr_path: str = None, wechat_path: str = None, temp_dir: str = None
+) -> bool:
     """
     初始化微信 OCR 引擎。
     成功返回 True，路径不合法返回 False。
@@ -36,6 +38,7 @@ def init(wechatocr_path: str = None, wechat_path: str = None, temp_dir: str = No
 
     # 从配置读取默认路径
     from utils.config import load as load_config
+
     cfg = load_config()
 
     # 设置临时目录（转换为绝对路径）
@@ -84,7 +87,11 @@ def _parse_result(result) -> str:
                 texts.append(t)
     elif isinstance(result, list):
         for item in result:
-            t = item.get("text", "").strip() if isinstance(item, dict) else str(item).strip()
+            t = (
+                item.get("text", "").strip()
+                if isinstance(item, dict)
+                else str(item).strip()
+            )
             if t:
                 texts.append(t)
     else:

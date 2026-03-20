@@ -1,6 +1,7 @@
 """
 core/fingerprint.py
-指纹识别模块 - 识别游戏中的指纹密码
+指纹识别模块：
+  截屏 → OCR识别人名/数字 → 模式判断 → 模板匹配 → 自动点击 / 保存标注图
 """
 
 import os
@@ -8,309 +9,256 @@ import re
 import time
 import numpy as np
 import cv2
-import ctypes
-from ctypes import wintypes, windll
-from PIL import ImageGrab
+from datetime import datetime
+from PIL import Image, ImageDraw, ImageFont, ImageGrab
 
-# 直接导入 core.ocr 模块
-from core import ocr as ocr_module
-
-# OCR 模块引用（备用）
-_wechat_ocr = None
+from core import ocr as _ocr
 
 
-def set_wechat_ocr(ocr_module):
-    """设置微信OCR模块实例"""
-    global _wechat_ocr
-    _wechat_ocr = ocr_module
+# ── OCR 纠错映射表 ───────────────────────────────────────────
+# 微信 OCR 偶有字形相似的误识别，在此做强制纠正
+
+_OCR_CORRECTION_MAP = {
+    "克菜尔": "克莱尔",
+}
 
 
-# ── 配置（在 run_fingerprint_pipeline 中从 app_cfg 加载）──────
-
-NAME_REGION = None  # 人名区域
-NUMBER_REGION = None  # 数字区域
-CANDIDATE_BOXES = None  # 候选指纹区域
-MODE_CONFIG = None  # 模式配置
+# ── 图片工具函数 ─────────────────────────────────────────────
 
 
-# ── 辅助函数 ─────────────────────────────────────────────
-
-# Windows API 鼠标点击常量
-_MOUSEEVENTF_MOVE       = 0x0001
-_MOUSEEVENTF_LEFTDOWN   = 0x0002
-_MOUSEEVENTF_LEFTUP     = 0x0004
-_MOUSEEVENTF_ABSOLUTE   = 0x8000
-
-_user32 = ctypes.WinDLL("user32", use_last_error=True)
-_shell32 = ctypes.WinDLL("shell32", use_last_error=True)
-
-# 声明 DPI 感知：让进程直接使用物理像素坐标，消除系统缩放换算
-try:
-    ctypes.windll.shcore.SetProcessDpiAwareness(2)  # PROCESS_PER_MONITOR_DPI_AWARE
-except Exception:
-    try:
-        _user32.SetProcessDPIAware()
-    except Exception:
-        pass
-
-
-def _activate_window(hwnd: int) -> None:
-    """将窗口置前并激活"""
-    if hwnd:
-        # 检查窗口是否最小化，如果是则还原
-        if _user32.IsIconic(hwnd):
-            _user32.ShowWindow(hwnd, 9)  # SW_RESTORE
-        # 置前并激活
-        _user32.SetForegroundWindow(hwnd)
-        _shell32.SHGetKnownFolderIDList
-
-
-def _find_game_window() -> int:
-    """查找游戏窗口句柄"""
-    # 尝试多种可能的窗口标题
-    titles = ["三角洲", "Delta Force", "游戏"]
-    for title in titles:
-        hwnd = _user32.FindWindowW(None, title)
-        if hwnd:
-            return hwnd
-    return 0
-
-
-def _win_click(x: int, y: int) -> None:
-    """使用 Windows SendMessage + mouse_event 执行可靠点击。
-    
-    进程已声明 DPI 感知，坐标直接对应物理像素。
-    增加移动后等待，确保游戏响应。
-    """
-    # 移动鼠标
-    _user32.SetCursorPos(x, y)
-    # time.sleep(0.05)  # 等待鼠标移动完成
-
-    # 按下
-    _user32.mouse_event(0x0002, 0, 0, 0, 0)  # MOUSEEVENTF_LEFTDOWN
-    time.sleep(0.05)  # 等待按下生效
-    # 释放
-    _user32.mouse_event(0x0004, 0, 0, 0, 0)  # MOUSEEVENTF_LEFTUP
-
-
-
-
-def pil_to_cv2(pil_img):
-    """PIL Image 转换为 OpenCV 格式"""
-    return cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
-
-
-def crop_region(img, x1, y1, x2, y2):
-    """裁剪图片区域"""
+def _crop(img: np.ndarray, x1: int, y1: int, x2: int, y2: int) -> np.ndarray | None:
+    """安全裁剪图片，超出边界时自动截断。"""
     h, w = img.shape[:2]
     x1, y1 = max(0, x1), max(0, y1)
     x2, y2 = min(w, x2), min(h, y2)
-    if x2 <= x1 or y2 <= y1:
+    return img[y1:y2, x1:x2] if x2 > x1 and y2 > y1 else None
+
+
+def _cv2_read(path: str) -> np.ndarray | None:
+    """读取图片（支持中文路径）。"""
+    if not os.path.exists(path):
         return None
-    return img[y1:y2, x1:x2]
+    data = np.fromfile(path, dtype=np.uint8)
+    return cv2.imdecode(data, cv2.IMREAD_COLOR)
 
 
-def save_image_chinese(path, img):
-    """保存图片（支持中文路径）"""
+def _cv2_save(path: str, img: np.ndarray) -> None:
+    """保存图片（支持中文路径）。"""
     ext = os.path.splitext(path)[1].lower()
-    if ext in [".png", ".jpg", ".jpeg"]:
+    if ext in (".png", ".jpg", ".jpeg"):
         _, buf = cv2.imencode(ext, img)
         buf.tofile(path)
     else:
         cv2.imwrite(path, img)
 
 
-def save_temp_image(img):
-    """保存临时图片供OCR使用"""
-    import tempfile
-
-    temp_path = os.path.join(tempfile.gettempdir(), "temp_ocr.png")
-    # 转换为BGR保存
-    if len(img.shape) == 3 and img.shape[2] == 3:
-        img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-    else:
-        img_bgr = img
-    cv2.imwrite(temp_path, img_bgr)
-    return temp_path
+def _pil_to_cv2(pil_img: Image.Image) -> np.ndarray:
+    """PIL Image → OpenCV BGR 格式。"""
+    return cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
 
 
-def ocr_recognize(img):
+# ── 人名纠错 ─────────────────────────────────────────────────
+
+
+def _correct_person_name(raw_name: str, images_dir: str) -> str:
     """
-    使用微信OCR识别图片中的文字
-    返回: 识别到的文本列表
+    对 OCR 识别的原始人名进行纠错：
+      1. 精确映射表
+      2. 模糊匹配（字符相似度 ≥ 0.6 → 匹配 images/ 下同名目录）
+    返回纠错后的人名，无法确定时返回原始值。
     """
+    name = raw_name.strip()
+
+    # 精确映射
+    if name in _OCR_CORRECTION_MAP:
+        corrected = _OCR_CORRECTION_MAP[name]
+        if corrected != name:
+            print(f"  [纠错] '{name}' → '{corrected}'")
+        return corrected
+
+    # 目录精确匹配
+    if os.path.isdir(os.path.join(images_dir, name)):
+        return name
+
+    # 模糊匹配
     try:
-        # 转换 cv2 图片为 PIL Image
-        if len(img.shape) == 3:
-            img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        else:
-            img_rgb = img
-        from PIL import Image
-        pil_img = Image.fromarray(img_rgb)
+        candidates = [
+            d
+            for d in os.listdir(images_dir)
+            if os.path.isdir(os.path.join(images_dir, d))
+        ]
+    except OSError:
+        return name
 
-        # 调用 OCR 的 recognize 方法
-        result = ocr_module.recognize(pil_img)
+    def _similarity(a: str, b: str) -> float:
+        return sum(1 for c in a if c in b) / max(len(a), len(b), 1)
 
-        if result:
-            return [result]
-        return []
-    except Exception as e:
-        print(f"[WARNING] OCR识别失败: {e}")
-        return []
+    best = max(candidates, key=lambda c: _similarity(name, c), default=None)
+    if best and _similarity(name, best) >= 0.6:
+        print(f"  [纠错] 模糊匹配 '{name}' → '{best}'")
+        return best
 
-
-def extract_numbers_from_region(img):
-    """从数字区域提取所有数字"""
-
-    try:
-        # 转换 cv2 图片为 PIL Image
-        if len(img.shape) == 3:
-            img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        else:
-            img_rgb = img
-        from PIL import Image
-
-        pil_img = Image.fromarray(img_rgb)
-
-        # 调用 OCR
-        result = ocr_module.recognize(pil_img)
-
-        numbers = []
-        if result:
-            nums = re.findall(r"\d+", result)
-            for n in nums:
-                numbers.append(int(n))
-
-        return numbers
-    except Exception as e:
-        print(f"[WARNING] 数字识别失败: {e}")
-        return []
+    return name
 
 
-def _imread_chinese(path):
-    """读取图片（支持中文路径）"""
-    if not os.path.exists(path):
-        return None
-    data = np.fromfile(path, dtype=np.uint8)
-    img = cv2.imdecode(data, cv2.IMREAD_COLOR)
-    return img
+# ── 模板加载 ─────────────────────────────────────────────────
 
 
-def load_fingerprint_templates(person_name, images_dir, max_templates=8):
+def load_templates(person_name: str, images_dir: str, max_count: int = 8) -> list[dict]:
     """
-    根据人名加载指纹模板（灰度图）
-    Args:
-        person_name: 人名
-        images_dir: 模板目录
-        max_templates: 最大模板数量，根据模式确定
-    返回: 模板列表，每项包含 (index, 灰度图)
+    加载指定人名目录下的指纹模板（灰度图）。
+    返回 [{"index": int, "image": np.ndarray}, ...]，按编号排序。
     """
     templates = []
-
-    # 优先查找同名文件夹
     person_dir = os.path.join(images_dir, person_name)
 
-    if os.path.exists(person_dir):
-        for i in range(1, max_templates + 1):
-            template_path = os.path.join(person_dir, f"{i}.png")
-            if os.path.exists(template_path):
-                img = _imread_chinese(template_path)
-                if img is not None:
-                    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-                    templates.append({
-                        'index': i,
-                        'image': gray
-                    })
+    # 优先查找同名文件夹
+    if os.path.isdir(person_dir):
+        for i in range(1, max_count + 1):
+            path = os.path.join(person_dir, f"{i}.png")
+            img = _cv2_read(path)
+            if img is not None:
+                gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+                templates.append({"index": i, "image": gray})
         if templates:
             return templates
 
-    # 查找根目录下的同名文件
+    # 兜底：根目录下同名文件
     for fname in os.listdir(images_dir):
         if fname.startswith(person_name) and fname.endswith(".png"):
-            template_path = os.path.join(images_dir, fname)
-            img = _imread_chinese(template_path)
+            img = _cv2_read(os.path.join(images_dir, fname))
             if img is not None:
                 gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-                idx = int(fname.split('.')[0]) if fname[0].isdigit() else len(templates) + 1
-                templates.append({
-                    'index': idx,
-                    'image': gray
-                })
+                idx = (
+                    int(fname.split(".")[0])
+                    if fname[0].isdigit()
+                    else len(templates) + 1
+                )
+                templates.append({"index": idx, "image": gray})
 
     return templates
 
 
-def find_best_match(candidate_img, templates, threshold=0.5):
+# ── 模板匹配 ─────────────────────────────────────────────────
+
+
+def find_best_match(
+    candidate_img: np.ndarray, templates: list[dict], threshold: float = 0.5
+) -> tuple[int | None, float]:
     """
-    使用像素模板匹配找到最佳匹配
-    返回: (最佳模板索引, 匹配分数)
+    在候选图像中寻找最佳匹配的模板。
+    返回 (模板索引, 匹配分数)，不命中返回 (None, best_score)。
     """
     if not templates:
-        return None, 0
+        return None, 0.0
 
-    # 转为灰度图
-    if len(candidate_img.shape) == 3:
-        candidate_gray = cv2.cvtColor(candidate_img, cv2.COLOR_BGR2GRAY)
-    else:
-        candidate_gray = candidate_img
+    cand_gray = (
+        cv2.cvtColor(candidate_img, cv2.COLOR_BGR2GRAY)
+        if len(candidate_img.shape) == 3
+        else candidate_img
+    )
 
-    best_idx = None
-    best_score = 0
+    best_idx, best_score = None, 0.0
+    h, w = cand_gray.shape
 
-    for template in templates:
-        template_img = template['image']
-
-        # 调整模板大小与候选图像一致
-        h, w = candidate_gray.shape
-        template_resized = cv2.resize(template_img, (w, h))
-
-        # 像素模板匹配
-        result = cv2.matchTemplate(
-            candidate_gray, template_resized, cv2.TM_CCOEFF_NORMED
+    for tmpl in templates:
+        resized = cv2.resize(tmpl["image"], (w, h))
+        _, max_val, _, _ = cv2.minMaxLoc(
+            cv2.matchTemplate(cand_gray, resized, cv2.TM_CCOEFF_NORMED)
         )
-        _, max_val, _, _ = cv2.minMaxLoc(result)
-
         if max_val > best_score:
             best_score = max_val
-            best_idx = template['index'] - 1  # 转回0索引
+            best_idx = tmpl["index"] - 1  # 转回 0 索引
 
-    if best_score > threshold:
-        return best_idx, best_score
-    return None, best_score
+    return (best_idx, best_score) if best_score > threshold else (None, best_score)
 
 
-# ── 主流程 ─────────────────────────────────────────────
+# ── 标注图 ───────────────────────────────────────────────────
 
 
-def run_fingerprint_pipeline(app_cfg: dict, save_dir: str = None):
-    """
-    指纹识别主流程
+def _draw_annotated(
+    screen_bgr: np.ndarray,
+    person_name: str,
+    numbers: list[int],
+    matches: dict[int, int],
+    name_reg: dict,
+    num_reg: dict,
+    boxes: list[tuple],
+) -> Image.Image:
+    """在截图上绘制标注框并返回 PIL 图片。"""
+    pil_img = Image.fromarray(cv2.cvtColor(screen_bgr, cv2.COLOR_BGR2RGB))
+    draw = ImageDraw.Draw(pil_img)
 
-    Args:
-        app_cfg: 应用配置字典
-        save_dir: 调试图片保存目录（可选，默认从配置读取）
-    """
-    from datetime import datetime
+    try:
+        font = ImageFont.truetype("msyh.ttc", 16)
+    except Exception:
+        font = ImageFont.load_default()
 
-    # 加载全局配置
-    global NAME_REGION, NUMBER_REGION, CANDIDATE_BOXES, MODE_CONFIG
-
-    fp_cfg = app_cfg.get("fingerprint", {})
+    C = {
+        "name": (255, 120, 120),  # 红色
+        "number": (120, 255, 255),  # 青色
+        "candidate": (120, 255, 120),  # 绿色
+    }
 
     # 人名区域
-    name_region = fp_cfg.get(
-        "name_region", {"x1": 706, "y1": 657, "x2": 866, "y2": 689}
+    draw.rectangle(
+        [name_reg["x1"], name_reg["y1"], name_reg["x2"], name_reg["y2"]],
+        outline=C["name"],
+        width=1,
     )
-    NAME_REGION = name_region
+    draw.text(
+        (name_reg["x1"], name_reg["y1"] - 25),
+        f" 人名:{person_name} ",
+        fill=C["name"],
+        font=font,
+    )
 
     # 数字区域
-    number_region = fp_cfg.get(
+    draw.rectangle(
+        [num_reg["x1"], num_reg["y1"], num_reg["x2"], num_reg["y2"]],
+        outline=C["number"],
+        width=1,
+    )
+    draw.text(
+        (num_reg["x1"], num_reg["y1"] - 25),
+        f" 数字:{numbers} ",
+        fill=C["number"],
+        font=font,
+    )
+
+    # 候选格子
+    for cand_no in sorted(matches):
+        x1, y1, x2, y2 = boxes[cand_no - 1]
+        draw.rectangle([x1, y1, x2, y2], outline=C["candidate"], width=1)
+        draw.text(
+            (x1, y1 - 25),
+            f" 候选{cand_no}→模板{matches[cand_no]} ",
+            fill=C["candidate"],
+            font=font,
+        )
+
+    return pil_img
+
+
+# ── 主流程 ───────────────────────────────────────────────────
+
+
+def run_fingerprint_pipeline(app_cfg: dict, save_dir: str = None) -> None:
+    """
+    指纹识别主流程。
+    Args:
+        app_cfg:  完整配置字典（含 fingerprint.* 子配置）
+        save_dir: 调试图片保存目录，默认取 app_cfg["save_dir"]
+    """
+    from utils.mouse import win_click, find_game_window, activate_window, click_sequence
+
+    # ── 解析配置 ────────────────────────────────────────────
+    fp_cfg = app_cfg.get("fingerprint", {})
+    name_reg = fp_cfg.get("name_region", {"x1": 706, "y1": 657, "x2": 866, "y2": 689})
+    num_reg = fp_cfg.get(
         "number_region", {"x1": 1030, "y1": 530, "x2": 1365, "y2": 930}
     )
-    NUMBER_REGION = number_region
-
-    # 候选指纹区域
-    candidate_boxes = fp_cfg.get(
+    boxes_cfg = fp_cfg.get(
         "candidate_boxes",
         [
             [1522, 560, 1627, 665],
@@ -324,213 +272,164 @@ def run_fingerprint_pipeline(app_cfg: dict, save_dir: str = None):
             [1778, 815, 1883, 920],
         ],
     )
-    CANDIDATE_BOXES = [tuple(box) for box in candidate_boxes]
+    boxes = [tuple(b) for b in boxes_cfg]
 
-    # 模式配置
     mode_cfg = fp_cfg.get(
         "mode_config",
         {
-            "8": {"mode": "C", "candidates": 9, "indices": [0, 1, 2, 3, 4, 5, 6, 7, 8]},
-            "6": {"mode": "B", "candidates": 7, "indices": [0, 1, 2, 3, 4, 5, 6]},
-            "4": {"mode": "A", "candidates": 5, "indices": [0, 1, 2, 3, 4]},
+            "8": {"mode": "C", "candidates": 9, "indices": list(range(9))},
+            "6": {"mode": "B", "candidates": 7, "indices": list(range(7))},
+            "4": {"mode": "A", "candidates": 5, "indices": list(range(5))},
         },
     )
-    MODE_CONFIG = {
+    mode_map = {
         int(k): (v["mode"], v["candidates"], v["indices"]) for k, v in mode_cfg.items()
     }
 
-    # 匹配阈值
-    match_threshold = fp_cfg.get("match_threshold", 0.5)
+    threshold = fp_cfg.get("match_threshold", 0.5)
+    images_dir = app_cfg.get("fingerprint_images_dir", "images")
+    save_dir = save_dir or app_cfg.get("save_dir", "temp")
 
-    # 保存目录
-    if save_dir is None:
-        save_dir = app_cfg.get("save_dir", "captures")
-
+    # ── 1. 截屏 ─────────────────────────────────────────────
     print(f"\n[{datetime.now().strftime('%H:%M:%S')}] ── 指纹识别开始 ──")
+    screen_bgr = _pil_to_cv2(ImageGrab.grab())
 
-    # 1. 截取屏幕
-    screen_pil = ImageGrab.grab()
-    screen = pil_to_cv2(screen_pil)
-
-    # 2. 识别人名
+    # ── 2. OCR 人名 ─────────────────────────────────────────
     print("  识别人名...")
-    name_img = crop_region(
-        screen,
-        NAME_REGION["x1"],
-        NAME_REGION["y1"],
-        NAME_REGION["x2"],
-        NAME_REGION["y2"],
+    name_img = _crop(
+        screen_bgr, name_reg["x1"], name_reg["y1"], name_reg["x2"], name_reg["y2"]
     )
-
     if name_img is None:
         print("  [ERROR] 人名区域裁剪失败")
         return
 
-    # 识别人名
-    name_texts = ocr_recognize(name_img)
-
-    if not name_texts:
+    name_pil = Image.fromarray(cv2.cvtColor(name_img, cv2.COLOR_BGR2RGB))
+    raw_name = _ocr.recognize(name_pil).strip()
+    if not raw_name:
         print("  [ERROR] 未识别到人名")
         return
 
-    person_name = name_texts[0].strip()
+    person_name = _correct_person_name(raw_name, images_dir)
     print(f"  识别到人名: {person_name}")
 
-    # 3. 识别数字区域，判断模式
+    # ── 3. OCR 数字区域 ────────────────────────────────────
     print("  识别数字区域...")
-    num_img = crop_region(
-        screen,
-        NUMBER_REGION["x1"],
-        NUMBER_REGION["y1"],
-        NUMBER_REGION["x2"],
-        NUMBER_REGION["y2"],
+    num_img = _crop(
+        screen_bgr, num_reg["x1"], num_reg["y1"], num_reg["x2"], num_reg["y2"]
     )
-
     if num_img is None:
         print("  [ERROR] 数字区域裁剪失败")
         return
 
-    numbers = extract_numbers_from_region(num_img)
+    num_pil = Image.fromarray(cv2.cvtColor(num_img, cv2.COLOR_BGR2RGB))
+    raw_text = _ocr.recognize(num_pil)
+    numbers = [int(n) for n in re.findall(r"\d+", raw_text)]
     print(f"  识别到的数字: {numbers}")
-
     if not numbers:
         print("  [ERROR] 未识别到数字")
         return
 
     max_num = max(numbers)
-
-    if max_num not in MODE_CONFIG:
+    if max_num not in mode_map:
         print(f"  [ERROR] 无法识别的数字: {max_num}")
         return
 
-    mode_name, n_candidates, candidate_indices = MODE_CONFIG[max_num]
-    print(f"  模式: {mode_name} ({n_candidates}个候选)")
+    mode_name, n_candidates, indices = mode_map[max_num]
+    print(f"  模式: {mode_name}（{n_candidates} 个候选）")
 
-    # 4. 根据模式加载对应数量的指纹模板
-    # 模式A(4个候选)→加载4个模板, 模式B(6个候选)→加载6个, 模式C(8个候选)→加载8个
-    images_dir = app_cfg.get("fingerprint_images_dir", "images")
+    # ── 4. 加载模板 ─────────────────────────────────────────
     print(f"  加载模板目录: {images_dir}")
-
-    max_templates = n_candidates - 1  # 候选数-1 = 模板数
-    templates = load_fingerprint_templates(person_name, images_dir, max_templates)
-
+    templates = load_templates(person_name, images_dir, n_candidates - 1)
     if not templates:
         print(f"  [ERROR] 未找到人名 '{person_name}' 的指纹模板")
-        # 保存截图用于调试
-        os.makedirs(save_dir, exist_ok=True)
-        screenshot_path = os.path.join(
-            save_dir, f"fp_{datetime.now().strftime('%H%M%S')}_error.png"
-        )
-        save_image_chinese(screenshot_path, screen)
-        print(f"  截图已保存: {screenshot_path}")
+        _save_debug(screen_bgr, save_dir)
         return
-
     print(f"  加载了 {len(templates)} 个模板")
 
-    # 5. 像素模板匹配
+    # ── 5. 模板匹配 ────────────────────────────────────────
     print("  像素模板匹配...")
-    matches = {}
-
-    for cand_idx in candidate_indices:
-        x1, y1, x2, y2 = CANDIDATE_BOXES[cand_idx]
-        candidate_img = crop_region(screen, x1, y1, x2, y2)
-
-        if candidate_img is None:
+    matches: dict[int, int] = {}
+    for ci in indices:
+        cand = _crop(screen_bgr, *boxes[ci])
+        if cand is None:
             continue
-
-        best_idx, best_score = find_best_match(
-            candidate_img, templates, threshold=match_threshold
-        )
-
-        if best_idx is not None:
-            matches[cand_idx + 1] = best_idx + 1
-            print(
-                f"    候选 {cand_idx + 1}: 匹配模板 {best_idx + 1}, 分数={best_score:.3f}"
-            )
+        idx, score = find_best_match(cand, templates, threshold)
+        if idx is not None:
+            matches[ci + 1] = idx + 1
+            print(f"    候选 {ci + 1}: 匹配模板 {idx + 1}, 分数={score:.3f}")
         else:
-            print(f"    候选 {cand_idx + 1}: 未匹配 (分数={best_score:.3f})")
+            print(f"    候选 {ci + 1}: 未匹配 (分数={score:.3f})")
 
-    # 输出结果
     print(f"\n  ★ 指纹密码答案:")
-    for cand_no in sorted(matches.keys()):
-        template_no = matches[cand_no]
-        print(f"    候选 {cand_no}  →  模板 {template_no}")
+    for cn in sorted(matches):
+        print(f"    候选 {cn}  →  模板 {matches[cn]}")
 
-    # 6. 自动点击（如果启用）
+    # ── 6. 后处理：点击 / 标注图 ─────────────────────────────
     if app_cfg.get("fingerprint_auto_click", False):
-        print("\n  执行自动点击...")
-        # 尝试激活游戏窗口
-        game_hwnd = _find_game_window()
-        if game_hwnd:
-            print(f"  找到游戏窗口: {game_hwnd}")
-            _activate_window(game_hwnd)
-            time.sleep(0.1)  # 等待窗口激活
-        else:
-            print("  未找到游戏窗口，将直接点击")
-
-        # 按模板编号顺序点击：反转 matches 为 {模板编号: 候选编号}
-        template_to_cand = {template_no: cand_no for cand_no, template_no in matches.items()}
-        for template_no in sorted(template_to_cand.keys()):
-            cand_no = template_to_cand[template_no]
-            x1, y1, x2, y2 = CANDIDATE_BOXES[cand_no - 1]
-            cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
-            _win_click(cx, cy)
-            print(f"    模板 {template_no} → 点击候选 {cand_no} @ ({cx}, {cy})")
-            time.sleep(0.05)  # 增加等待时间，确保游戏响应
-        print("  点击完成!")
+        _do_auto_click(boxes, matches, save_dir, app_cfg, mode_name)
     else:
-        # 保存标注图（手动模式）- 使用PIL绘制
-        print("\n  保存标注图...")
-        from PIL import Image, ImageDraw, ImageFont
-
-        # cv2 (BGR) 转 PIL (RGB)
-        annotated_pil = Image.fromarray(cv2.cvtColor(screen, cv2.COLOR_BGR2RGB))
-        draw = ImageDraw.Draw(annotated_pil)
-
-        # 尝试加载字体，失败则用默认
-        try:
-            font = ImageFont.truetype("simsun.ttc", 16)
-        except:
-            font = ImageFont.load_default()
-
-        # 标注颜色
-        NAME_COLOR = (255,120,120)      # 红色 - 人名区域
-        NUMBER_COLOR = (120,255,255)  # 青色 - 数字区域
-        CANDIDATE_COLOR = (120,255,120)  # 绿色 - 候选指纹区域
-
-        # 标注人名区域
-        draw.rectangle(
-            [NAME_REGION["x1"], NAME_REGION["y1"], NAME_REGION["x2"], NAME_REGION["y2"]],
-            outline=NAME_COLOR, width=1
+        _do_annotated(
+            screen_bgr,
+            person_name,
+            numbers,
+            matches,
+            name_reg,
+            num_reg,
+            boxes,
+            save_dir,
         )
-        draw.text((NAME_REGION["x1"], NAME_REGION["y1"] - 25), f" 人名:{person_name} ",
-                  fill=NAME_COLOR, font=font)
 
-        # 标注数字区域
-        draw.rectangle(
-            [NUMBER_REGION["x1"], NUMBER_REGION["y1"], NUMBER_REGION["x2"], NUMBER_REGION["y2"]],
-            outline=NUMBER_COLOR, width=1
-        )
-        draw.text((NUMBER_REGION["x1"], NUMBER_REGION["y1"] - 25), f" 数字:{numbers} ",
-                  fill=NUMBER_COLOR, font=font)
 
-        # 标注候选指纹区域
-        for cand_no in sorted(matches.keys()):
-            x1, y1, x2, y2 = CANDIDATE_BOXES[cand_no - 1]
-            template_no = matches[cand_no]
+# ── 内部后处理 ───────────────────────────────────────────────
 
-            # 画矩形框
-            draw.rectangle([x1, y1, x2, y2], outline=CANDIDATE_COLOR, width=1)
 
-            # 标签
-            label = f" 候选{cand_no}→模板{template_no} "
-            draw.text((x1, y1 - 25), label, fill=CANDIDATE_COLOR, font=font)
+def _do_auto_click(boxes, matches, save_dir, app_cfg, mode_name):
+    """自动点击模式：按模板顺序点击候选格子 → 延迟确认点击。"""
+    from utils.mouse import win_click, find_game_window, activate_window, click_sequence
 
-        os.makedirs(save_dir, exist_ok=True)
-        annotated_path = os.path.join(
-            save_dir, f"fp_{datetime.now().strftime('%H%M%S')}_annotated.png"
-        )
-        annotated_pil.save(annotated_path)
-        print(f"  标注图已保存: {annotated_path}")
+    print("\n  执行自动点击...")
+    hwnd = find_game_window()
+    if hwnd:
+        print(f"  找到游戏窗口: {hwnd}")
+        activate_window(hwnd)
+        time.sleep(0.1)
+    else:
+        print("  未找到游戏窗口，将直接点击")
 
-    print()
+    t2c = {tn: cn for cn, tn in matches.items()}
+    for tn in sorted(t2c):
+        cn = t2c[tn]
+        x1, y1, x2, y2 = boxes[cn - 1]
+        win_click((x1 + x2) // 2, (y1 + y2) // 2)
+        print(f"    模板 {tn} → 点击候选 {cn}")
+        time.sleep(0.05)
+
+    confirm = app_cfg.get("morse_confirm_clicks", [])
+    if confirm:
+        time.sleep(1.7)
+        print("  点击下载")
+        click_sequence(confirm, delay=0.05)
+
+
+def _do_annotated(
+    screen_bgr, person_name, numbers, matches, name_reg, num_reg, boxes, save_dir
+):
+    """手动模式：保存标注图。"""
+    print("\n  保存标注图...")
+    pil = _draw_annotated(
+        screen_bgr, person_name, numbers, matches, name_reg, num_reg, boxes
+    )
+    os.makedirs(save_dir, exist_ok=True)
+    path = os.path.join(
+        save_dir, f"fp_{datetime.now().strftime('%H%M%S')}_annotated.png"
+    )
+    pil.save(path)
+    print(f"  标注图已保存: {path}")
+
+
+def _save_debug(screen_bgr, save_dir):
+    """调试截图：匹配失败时保存。"""
+    os.makedirs(save_dir, exist_ok=True)
+    path = os.path.join(save_dir, f"fp_{datetime.now().strftime('%H%M%S')}_error.png")
+    _cv2_save(path, screen_bgr)
+    print(f"  截图已保存: {path}")
